@@ -20,3 +20,6 @@ __pycache__/
 # Temporary and IDE files
 .vscode/
 compile_commands.json
+flatten.py
+flattened_workspace/
+temp.zsh
