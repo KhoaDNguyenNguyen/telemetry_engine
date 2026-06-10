@@ -5,6 +5,7 @@
 void Graphics3D_ComputeRotationMatrix(float *matrix, float angle_x, float angle_y, float angle_z) {
     if (!matrix) return;
 
+    /* Formulation of Tait-Bryan Z-Y-X Extrinsic Rotation Matrix */
     const float cx = cosf(angle_x);
     const float sx = sinf(angle_x);
     const float cy = cosf(angle_y);
@@ -12,16 +13,23 @@ void Graphics3D_ComputeRotationMatrix(float *matrix, float angle_x, float angle_
     const float cz = cosf(angle_z);
     const float sz = sinf(angle_z);
 
+    /* Algebraic reassociation for optimal execution pipeline */
+    const float sx_sy = sx * sy;
+    const float cx_sy = cx * sy;
+
+    /* Row 0 */
     matrix[0] = cy * cz;
-    matrix[1] = -cy * sz;
-    matrix[2] = sy;
+    matrix[1] = cz * sx_sy - cx * sz;
+    matrix[2] = cx_sy * cz + sx * sz;
 
-    matrix[3] = cx * sz + cz * sx * sy;
-    matrix[4] = cx * cz - sx * sy * sz;
-    matrix[5] = -cy * sx;
+    /* Row 1 */
+    matrix[3] = cy * sz;
+    matrix[4] = cx * cz + sx_sy * sz;
+    matrix[5] = cx_sy * sz - cz * sx;
 
-    matrix[6] = sx * sz - cx * cz * sy;
-    matrix[7] = cz * sx + cx * sy * sz;
+    /* Row 2 */
+    matrix[6] = -sy;
+    matrix[7] = cy * sx;
     matrix[8] = cx * cy;
 }
 
@@ -30,6 +38,17 @@ void Graphics3D_RotateVertices(const Vector3D *restrict input, Vector3D *restric
     if (!input || !output || !matrix || count == 0) return;
 
 #if defined(__aarch64__)
+    /* 
+     * Synthesize a 4x4 column-major matrix strictly aligned to 16 bytes boundaries.
+     * This isolates the generic 3x3 row-major public API from the strict vectorization 
+     * demands of the ARM NEON pipeline, preventing memory corruption during ld1 loads.
+     */
+    float c_mat[12] __attribute__((aligned(16))) = {
+        matrix[0], matrix[3], matrix[6], 0.0f, /* Column 0 */
+        matrix[1], matrix[4], matrix[7], 0.0f, /* Column 1 */
+        matrix[2], matrix[5], matrix[8], 0.0f  /* Column 2 */
+    };
+
     __asm__ volatile (
         "ld1 {v0.4s, v1.4s, v2.4s}, [%[mat]] \n\t"
         "1: \n\t"
@@ -41,7 +60,7 @@ void Graphics3D_RotateVertices(const Vector3D *restrict input, Vector3D *restric
         "subs %[cnt], %[cnt], #1 \n\t"
         "b.ne 1b \n\t"
         : [in] "+r" (input), [out] "+r" (output), [cnt] "+r" (count)
-        : [mat] "r" (matrix)
+        : [mat] "r" (c_mat)
         : "v0", "v1", "v2", "v3", "v4", "memory", "cc"
     );
 #else
@@ -114,7 +133,6 @@ void Graphics3D_DrawLine(uint16_t *restrict fb, uint16_t fb_width, uint16_t fb_h
     }
 }
 
-/* Hardcoded 8x8 ASCII Font Matrix */
 static const uint8_t font8x8_basic[96][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00}, 
     {0x6C,0x6C,0x6C,0x00,0x00,0x00,0x00,0x00}, {0x6C,0x6C,0xFE,0x6C,0xFE,0x6C,0x6C,0x00}, 
@@ -170,7 +188,6 @@ void Graphics3D_DrawChar(uint16_t *restrict fb, uint16_t fb_width, uint16_t fb_h
                          int16_t x, int16_t y, char c, uint16_t color, uint8_t scale) {
     uint8_t char_code = (uint8_t)c;
     
-    /* Discard non-printable ASCII definitions */
     if (!fb || char_code < 32 || char_code >= 127) return;
 
     const uint8_t *glyph = font8x8_basic[char_code - 32];
@@ -197,7 +214,6 @@ void Graphics3D_DrawString(uint16_t *restrict fb, uint16_t fb_width, uint16_t fb
                            int16_t x, int16_t y, const char *str, uint16_t color, uint8_t scale) {
     if (!fb || !str) return;
     
-    /* Upcast to 32-bit integer to avert truncation during multiplication accumulation */
     int32_t cursor_x = (int32_t)x;
     
     while (*str) {
