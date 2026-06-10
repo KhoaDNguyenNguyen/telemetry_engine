@@ -87,6 +87,7 @@ target_include_directories(test_3d_desktop PRIVATE
 
 add_library(engine_mock_shared SHARED
     core/src/st7789_logic.c
+    core/src/graphics_3d.c
     hal/mock_hal_x86.c
 )
 
