@@ -1,10 +1,11 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/init.h>
 #include <linux/fb.h>
 #include <linux/dma-mapping.h>
 #include <linux/platform_device.h>
-#include <linux/io.h>
+#include <linux/of.h>
+#include "../core/inc/st7789_logic.h"
+#include "hal_spi_rpi.h"
 
 #define DRIVER_NAME "telemetry_fb"
 #define ST7789_WIDTH 240
@@ -12,19 +13,23 @@
 #define BITS_PER_PIXEL 16
 #define FRAMEBUFFER_SIZE (ST7789_WIDTH * ST7789_HEIGHT * (BITS_PER_PIXEL / 8))
 
-/* Hardware state structure */
 struct telemetry_fb_info {
     struct fb_info *info;
-    void __iomem *spi_base; /* Memory-Mapped I/O address for SPI peripheral */
     dma_addr_t dma_handle;
+    const spi_driver_ops_t *spi_ops;
+    struct fb_deferred_io defio;
 };
 
-/**
- * @brief Memory map callback for user-space zero-copy access.
- * 
- * Maps the physically contiguous kernel memory allocated for the framebuffer
- * directly into the virtual address space of the user-space 3D engine.
- */
+static void TelemetryFB_Deferred_IO(struct fb_info *info, struct list_head *pagelist)
+{
+    struct telemetry_fb_info *drv_data = info->par;
+    
+    /* Hardware projection of the virtual framebuffer to the SPI subsystem */
+    if (drv_data->spi_ops) {
+        ST7789_FlushBuffer(drv_data->spi_ops, (uint16_t *)info->screen_base, ST7789_WIDTH * ST7789_HEIGHT);
+    }
+}
+
 static int TelemetryFB_Mmap(struct fb_info *info, struct vm_area_struct *vma)
 {
     unsigned long start = vma->vm_start;
@@ -36,10 +41,7 @@ static int TelemetryFB_Mmap(struct fb_info *info, struct vm_area_struct *vma)
         return -EINVAL;
     }
 
-    /* Convert logical memory address to Page Frame Number (PFN) */
     pfn = virt_to_phys(info->screen_base + offset) >> PAGE_SHIFT;
-
-    /* Enforce uncacheable memory for direct hardware coherence */
     vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
     if (remap_pfn_range(vma, start, pfn, size, vma->vm_page_prot)) {
@@ -50,36 +52,41 @@ static int TelemetryFB_Mmap(struct fb_info *info, struct vm_area_struct *vma)
 }
 
 static struct fb_ops telemetry_fb_ops = {
-    .owner      = THIS_MODULE,
-    .fb_mmap    = TelemetryFB_Mmap,
-    .fb_fillrect = cfb_fillrect,
-    .fb_copyarea = cfb_copyarea,
-    .fb_imageblit = cfb_imageblit,
+    .owner       = THIS_MODULE,
+    .fb_mmap     = TelemetryFB_Mmap,
+    .fb_fillrect = sys_fillrect,
+    .fb_copyarea = sys_copyarea,
+    .fb_imageblit= sys_imageblit,
 };
 
-static int __init TelemetryFB_Init(void)
+static int TelemetryFB_Probe(struct platform_device *pdev)
 {
     struct telemetry_fb_info *drv_data;
     struct fb_info *info;
     int ret;
 
-    pr_info("%s: Initializing High-Performance Telemetry Framebuffer\n", DRIVER_NAME);
+    pr_info("%s: Probing Device Tree for ST7789 interface.\n", DRIVER_NAME);
 
-    info = framebuffer_alloc(sizeof(struct telemetry_fb_info), NULL);
-    if (!info) {
-        pr_err("%s: Failed to allocate framebuffer info structure\n", DRIVER_NAME);
-        return -ENOMEM;
-    }
+    info = framebuffer_alloc(sizeof(struct telemetry_fb_info), &pdev->dev);
+    if (!info) return -ENOMEM;
 
     drv_data = info->par;
     drv_data->info = info;
 
-    /* Allocate physically contiguous DMA-coherent memory */
-    info->screen_base = dma_alloc_coherent(NULL, FRAMEBUFFER_SIZE, &drv_data->dma_handle, GFP_KERNEL);
+    /* Initialize Hardware Abstraction Layer */
+    drv_data->spi_ops = RPi_SPI_Init(pdev);
+    if (!drv_data->spi_ops) {
+        ret = -EIO;
+        goto err_fb_alloc;
+    }
+
+    /* Execute Hardware Initialization Sequence */
+    ST7789_InitSequence(drv_data->spi_ops);
+
+    info->screen_base = dma_alloc_coherent(&pdev->dev, FRAMEBUFFER_SIZE, &drv_data->dma_handle, GFP_KERNEL);
     if (!info->screen_base) {
-        pr_err("%s: DMA allocation failure\n", DRIVER_NAME);
-        framebuffer_release(info);
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto err_spi_init;
     }
 
     info->screen_size = FRAMEBUFFER_SIZE;
@@ -94,30 +101,61 @@ static int __init TelemetryFB_Init(void)
     info->var.xres_virtual = ST7789_WIDTH;
     info->var.yres_virtual = ST7789_HEIGHT;
     info->var.bits_per_pixel = BITS_PER_PIXEL;
-
     info->fbops = &telemetry_fb_ops;
 
-    ret = register_framebuffer(info);
-    if (ret < 0) {
-        pr_err("%s: Failed to register framebuffer device\n", DRIVER_NAME);
-        dma_free_coherent(NULL, FRAMEBUFFER_SIZE, info->screen_base, drv_data->dma_handle);
-        framebuffer_release(info);
-        return ret;
-    }
+    /* Initialize Deferred I/O Polling (Set for 60 FPS equivalent) */
+    drv_data->defio.delay = HZ / 60;
+    drv_data->defio.deferred_io = TelemetryFB_Deferred_IO;
+    info->fbdefio = &drv_data->defio;
+    fb_deferred_io_init(info);
 
-    pr_info("%s: Framebuffer successfully mapped at physical address 0x%lx\n", DRIVER_NAME, (unsigned long)info->fix.smem_start);
+    ret = register_framebuffer(info);
+    if (ret < 0) goto err_dma_alloc;
+
+    platform_set_drvdata(pdev, drv_data);
+    pr_info("%s: DMA Framebuffer mapped and Deferred I/O established.\n", DRIVER_NAME);
+    return 0;
+
+err_dma_alloc:
+    fb_deferred_io_cleanup(info);
+    dma_free_coherent(&pdev->dev, FRAMEBUFFER_SIZE, info->screen_base, drv_data->dma_handle);
+err_spi_init:
+    RPi_SPI_Deinit();
+err_fb_alloc:
+    framebuffer_release(info);
+    return ret;
+}
+
+static int TelemetryFB_Remove(struct platform_device *pdev)
+{
+    struct telemetry_fb_info *drv_data = platform_get_drvdata(pdev);
+    
+    unregister_framebuffer(drv_data->info);
+    fb_deferred_io_cleanup(drv_data->info);
+    dma_free_coherent(&pdev->dev, FRAMEBUFFER_SIZE, drv_data->info->screen_base, drv_data->dma_handle);
+    RPi_SPI_Deinit();
+    framebuffer_release(drv_data->info);
+    
     return 0;
 }
 
-static void __exit TelemetryFB_Exit(void)
-{
-    /* Global pointer would typically be retrieved via platform_get_drvdata */
-    pr_info("%s: Unloading module, releasing coherent memory\n", DRIVER_NAME);
-}
+static const struct of_device_id telemetry_fb_of_match[] = {
+    { .compatible = "telemetry,st7789", },
+    { },
+};
+MODULE_DEVICE_TABLE(of, telemetry_fb_of_match);
 
-module_init(TelemetryFB_Init);
-module_exit(TelemetryFB_Exit);
+static struct platform_driver telemetry_fb_driver = {
+    .probe  = TelemetryFB_Probe,
+    .remove = TelemetryFB_Remove,
+    .driver = {
+        .name = DRIVER_NAME,
+        .of_match_table = telemetry_fb_of_match,
+    },
+};
+
+module_platform_driver(telemetry_fb_driver);
 
 MODULE_AUTHOR("Principal HPC Engineer");
-MODULE_DESCRIPTION("ARM NEON-Powered 3D Telemetry Framebuffer Driver");
+MODULE_DESCRIPTION("Deferred I/O Framebuffer mapping to MMIO SPI");
 MODULE_LICENSE("GPL");
