@@ -1,0 +1,26 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2835", "brcm,bcm2711";
+
+    fragment@0 {
+        target = <&spi0>;
+        __overlay__ {
+            status = "okay";
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            telemetry_st7789: st7789@0 {
+                compatible = "telemetry,st7789";
+                reg = <0>;
+                spi-max-frequency = <60000000>;
+
+                /* Define structural GPIO mapping */
+                /* Assuming GPIO 24 for Data/Command, GPIO 25 for Reset */
+                dc-gpios = <&gpio 24 0>;
+                reset-gpios = <&gpio 25 0>;
+            };
+        };
+    };
+};
