@@ -1,0 +1,22 @@
+# Compilation artifacts
+build/
+*.o
+*.a
+*.so
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+modules.order
+Module.symvers
+.built-in.a.cmd
+.*.cmd
+
+# Python Virtual Environments & Cache
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Temporary and IDE files
+.vscode/
+compile_commands.json
