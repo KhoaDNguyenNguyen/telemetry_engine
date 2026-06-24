@@ -70,10 +70,13 @@ static const spi_driver_ops_t rpi_spi_ops = {
 
 const spi_driver_ops_t* RPi_SPI_Init(struct platform_device *pdev)
 {
-    /* BCM2711 SPI0 Physical Base Address mapping */
-    /* In a strict production environment, this is extracted via platform_get_resource */
-    /* Fallback mapping implemented for explicit MMIO requirement */
-    spi_base_addr = ioremap(0xFE204000, 0x100); 
+    /* 
+     * BCM2837 (Raspberry Pi 3) SPI0 Physical Base Address mapping.
+     * Note: In a standard kernel driver, this address is dynamically 
+     * extracted via platform_get_resource() from the Device Tree. 
+     * Hardcoding is maintained here to explicitly test MMIO alignment.
+     */
+    spi_base_addr = ioremap(0x3F204000, 0x100); 
     if (!spi_base_addr) {
         pr_err("hal_spi_rpi: Failed to map SPI hardware registers.\n");
         return NULL;

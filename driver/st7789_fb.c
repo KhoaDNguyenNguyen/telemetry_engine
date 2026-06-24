@@ -51,12 +51,20 @@ static int TelemetryFB_Mmap(struct fb_info *info, struct vm_area_struct *vma)
     return 0;
 }
 
+/* 
+ * Self-contained stubs to satisfy the fb_ops interface.
+ * Eliminates the dependency on sysfillrect.ko, syscopyarea.ko, and sysimgblit.ko.
+ */
+static void TelemetryFB_FillRect(struct fb_info *info, const struct fb_fillrect *rect) {}
+static void TelemetryFB_CopyArea(struct fb_info *info, const struct fb_copyarea *region) {}
+static void TelemetryFB_ImageBlit(struct fb_info *info, const struct fb_image *image) {}
+
 static struct fb_ops telemetry_fb_ops = {
     .owner       = THIS_MODULE,
     .fb_mmap     = TelemetryFB_Mmap,
-    .fb_fillrect = sys_fillrect,
-    .fb_copyarea = sys_copyarea,
-    .fb_imageblit= sys_imageblit,
+    .fb_fillrect = TelemetryFB_FillRect,
+    .fb_copyarea = TelemetryFB_CopyArea,
+    .fb_imageblit= TelemetryFB_ImageBlit,
 };
 
 static int TelemetryFB_Probe(struct platform_device *pdev)

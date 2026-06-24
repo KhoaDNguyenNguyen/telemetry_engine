@@ -1,8 +1,11 @@
 #ifndef HAL_SPI_H
 #define HAL_SPI_H
 
+#ifdef __KERNEL__
+#include <linux/types.h>
+#else
 #include <stdint.h>
-
+#endif
 /**
  * @brief Abstract interface for Hardware SPI operations.
  * 

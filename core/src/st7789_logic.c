@@ -1,5 +1,10 @@
 #include "st7789_logic.h"
+
+#ifdef __KERNEL__
+#include <linux/types.h>
+#else
 #include <stddef.h>
+#endif
 
 /* ST7789 Standard Command Definitions */
 #define ST7789_SWRESET 0x01

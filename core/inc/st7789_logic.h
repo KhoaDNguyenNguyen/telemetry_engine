@@ -2,7 +2,12 @@
 #define ST7789_LOGIC_H
 
 #include "hal_spi.h"
+
+#ifdef __KERNEL__
+#include <linux/types.h>
+#else
 #include <stdint.h>
+#endif
 
 /**
  * @brief Executes the hex instruction sequence to initialize the ST7789 controller.

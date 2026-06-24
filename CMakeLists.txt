@@ -29,7 +29,8 @@ set(STRICT_WARNING_FLAGS "-Wall -Wextra -Werror -pedantic -Wstrict-prototypes -W
 #              significantly accelerating trigonometric and matrix multiplications.
 # -ftree-vectorize: Forces the compiler to analyze loops for SIMD translation.
 # -funroll-loops: Expands loops to minimize branching overhead.
-set(OPTIMIZATION_FLAGS "-O3 -march=native -ffast-math -ftree-vectorize -funroll-loops")
+set(OPTIMIZATION_FLAGS "-O3 -mcpu=cortex-a53 -ffast-math -ftree-vectorize -funroll-loops")
+
 
 # Apply the aggregated flags globally to all C compilations within this project.
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${STRICT_WARNING_FLAGS} ${OPTIMIZATION_FLAGS}")
