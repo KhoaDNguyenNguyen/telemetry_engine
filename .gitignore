@@ -23,3 +23,8 @@ compile_commands.json
 flatten.py
 flattened_workspace/
 temp.zsh
+qemu_env/
+.cache/
+diagnostic_env
+linux/
+rpi_env
