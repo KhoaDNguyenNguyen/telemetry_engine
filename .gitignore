@@ -30,3 +30,6 @@ linux/
 rpi_env.fw_cache/
 build_host/
 rootfs.cpio
+.fw_cache/
+build_host/
+rootfs.cpio
