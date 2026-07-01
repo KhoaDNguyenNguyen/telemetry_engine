@@ -27,4 +27,6 @@ qemu_env/
 .cache/
 diagnostic_env
 linux/
-rpi_env
+rpi_env.fw_cache/
+build_host/
+rootfs.cpio
