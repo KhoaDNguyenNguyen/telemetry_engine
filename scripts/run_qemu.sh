@@ -23,6 +23,6 @@ qemu-system-aarch64 \
     -kernel "${KERNEL_IMAGE}" \
     -dtb "${DTB_FILE}" \
     -initrd "${INITRAMFS}" \
-    -append "console=ttyAMA0 root=/dev/ram0 rw init=/init loglevel=4 panic=1" \
+    -append "console=ttyAMA0 root=/dev/ram0 rw init=/init loglevel=4 panic=1 iomem=relaxed iomem=relaxed iomem=relaxed" \
     -nographic \
     -serial mon:stdio
