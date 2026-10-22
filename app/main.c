@@ -5,6 +5,7 @@
 #include "st7789_logic.h"
 #include "graphics_3d.h"
 #include "boot_logo.h"
+#include "assets.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -12,339 +13,308 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
-#include <signal.h>
 #include <errno.h>
-
-#define TFT_WIDTH  240
-#define TFT_HEIGHT 240
-#define PIXEL_COUNT (TFT_WIDTH * TFT_HEIGHT)
-#define VERTEX_COUNT 12
-#define EDGE_COUNT 12
-
-static uint16_t frame_buffer[PIXEL_COUNT];
-
-/* --- SYSTEM LIFECYCLE --- */
 
 static int system_mount_vfs(void) {
     if (mkdir("/dev", 0755) < 0 && errno != EEXIST) return -1;
     if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) < 0) return -1;
-    
     if (mkdir("/sys", 0755) < 0 && errno != EEXIST) return -1;
     if (mount("sysfs", "/sys", "sysfs", 0, NULL) < 0) return -1;
-    
     if (mkdir("/proc", 0755) < 0 && errno != EEXIST) return -1;
     if (mount("proc", "/proc", "proc", 0, NULL) < 0) return -1;
-    
     return 0;
 }
 
-static void system_panic(void) {
-    while (1) { usleep(1000000); }
+#define TFT_WIDTH  240
+#define TFT_HEIGHT 240
+#define PIXEL_COUNT (TFT_WIDTH * TFT_HEIGHT)
+
+#define BTN_JUMP  ((uint8_t)16)
+#define BTN_DUCK  ((uint8_t)20)
+#define BTN_START ((uint8_t)21)
+
+#define I2C_SDA ((uint8_t)2)
+#define I2C_SCL ((uint8_t)3)
+#define LCD_ADDR 0x27
+
+static inline void i2c_delay(void) { 
+    for(volatile int i = 0; i < 2000; i++) __asm__ volatile("nop");
 }
 
-/* --- BACKGROUND STRESS SIMULATOR --- */
+static void i2c_set_scl(uint8_t state) {
+    if (state) {
+        hal_gpio_set_function(I2C_SCL, GPIO_INPUT);
+    } else {
+        hal_gpio_write(I2C_SCL, 0);
+        hal_gpio_set_function(I2C_SCL, GPIO_OUTPUT);
+    }
+    i2c_delay();
+}
 
-/**
- * @brief Forks a background sequencer to periodically stress the CPU.
- * Simulates engine revving (thermal load) by spawning and killing infinite-loop workers.
- */
-static void load_sim_start_background(void) {
-    pid_t sequencer_pid = fork();
-    if (sequencer_pid == 0) {
-        while (1) {
-            pid_t workers[4];
-            
-            /* Phase 1: High sustained load (Revving up) */
-            for (int32_t i = 0; i < 4; i++) {
-                if ((workers[i] = fork()) == 0) {
-                    while(1); /* Child process: Burn CPU cycles */
-                }
-            }
-            sleep(40);
-            
-            /* Phase 2: Complete idle (Cooling down) */
-            for (int32_t i = 0; i < 4; i++) kill(workers[i], SIGKILL);
-            for (int32_t i = 0; i < 4; i++) waitpid(workers[i], NULL, 0);
-            sleep(15);
-            
-            /* Phase 3: Rapid burst load (Pulsing) */
-            for (int32_t r = 0; r < 4; r++) {
-                for (int32_t i = 0; i < 4; i++) {
-                    if ((workers[i] = fork()) == 0) {
-                        while(1);
-                    }
-                }
-                sleep(5);
-                for (int32_t i = 0; i < 4; i++) kill(workers[i], SIGKILL);
-                for (int32_t i = 0; i < 4; i++) waitpid(workers[i], NULL, 0);
-                sleep(2);
-            }
-        }
-        exit(0);
+static void i2c_set_sda(uint8_t state) {
+    if (state) {
+        hal_gpio_set_function(I2C_SDA, GPIO_INPUT);
+    } else {
+        hal_gpio_write(I2C_SDA, 0);
+        hal_gpio_set_function(I2C_SDA, GPIO_OUTPUT);
+    }
+    i2c_delay();
+}
+
+static void i2c_start(void) {
+    i2c_set_sda(1); i2c_set_scl(1);
+    i2c_set_sda(0); i2c_set_scl(0);
+}
+
+static void i2c_stop(void) {
+    i2c_set_sda(0); i2c_set_scl(1); i2c_set_sda(1);
+}
+
+static void i2c_write_byte(uint8_t data) {
+    for (int i = 0; i < 8; i++) {
+        i2c_set_sda((data & 0x80U) ? 1 : 0);
+        data <<= 1;
+        i2c_set_scl(1); i2c_set_scl(0);
+    }
+    i2c_set_sda(1); i2c_set_scl(1); i2c_set_scl(0);
+}
+
+static void lcd_send(uint8_t data, uint8_t mode) {
+    uint8_t high = (uint8_t)(data & 0xF0U);
+    uint8_t low = (uint8_t)((data << 4) & 0xF0U);
+    uint8_t bl = 0x08U;
+    i2c_start();
+    i2c_write_byte((uint8_t)(LCD_ADDR << 1)); 
+    i2c_write_byte((uint8_t)(high | mode | bl | 0x04U)); i2c_delay();
+    i2c_write_byte((uint8_t)(high | mode | bl)); i2c_delay();
+    i2c_write_byte((uint8_t)(low | mode | bl | 0x04U)); i2c_delay();
+    i2c_write_byte((uint8_t)(low | mode | bl)); i2c_delay();
+    i2c_stop();
+}
+
+static void lcd_send_cmd_raw(uint8_t data) {
+    uint8_t bl = 0x08U;
+    i2c_start();
+    i2c_write_byte((uint8_t)(LCD_ADDR << 1));
+    i2c_write_byte((uint8_t)(data | bl | 0x04U)); i2c_delay();
+    i2c_write_byte((uint8_t)(data | bl)); i2c_delay();
+    i2c_stop();
+}
+
+static void lcd_init(void) {
+    hal_gpio_write(I2C_SDA, 0);
+    hal_gpio_write(I2C_SCL, 0);
+    usleep(50000);
+    lcd_send_cmd_raw(0x30U); usleep(5000);
+    lcd_send_cmd_raw(0x30U); usleep(200);
+    lcd_send_cmd_raw(0x30U); usleep(200);
+    lcd_send_cmd_raw(0x20U); usleep(200);
+    lcd_send(0x28, 0); usleep(50);
+    lcd_send(0x0C, 0); usleep(50);
+    lcd_send(0x01, 0); usleep(2000);
+    lcd_send(0x06, 0); usleep(50);
+}
+
+static void lcd_print(const char *str, uint8_t line) {
+    lcd_send((uint8_t)((line == 1) ? 0x80U : 0xC0U), 0);
+    while (*str) {
+        lcd_send((uint8_t)(*str++), 1);
     }
 }
 
-/* --- SYSTEM TELEMETRY PROBES --- */
-
-static float read_cpu_load(void) {
-    static unsigned long long prev_user, prev_nice, prev_system, prev_idle;
-    unsigned long long user, nice, system, idle;
-    FILE *fd = fopen("/proc/stat", "r");
-    if (!fd) return 0.0f;
-    if (fscanf(fd, "cpu  %llu %llu %llu %llu", &user, &nice, &system, &idle) != 4) { 
-        fclose(fd); 
-        return 0.0f; 
-    }
-    fclose(fd);
-    unsigned long long total_diff = (user + nice + system + idle) - (prev_user + prev_nice + prev_system + prev_idle);
-    unsigned long long idle_diff = idle - prev_idle;
-    prev_user = user; prev_nice = nice; prev_system = system; prev_idle = idle;
-    return total_diff == 0 ? 0.0f : (float)(total_diff - idle_diff) / (float)total_diff;
-}
-
-static float read_cpu_temp(void) {
-    char path[64]; int max_temp = 0;
-    for (int32_t i = 0; i < 5; i++) {
-        snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", i);
-        FILE *fd = fopen(path, "r");
-        if (fd) {
-            int temp;
-            if (fscanf(fd, "%d", &temp) == 1 && temp > max_temp && temp < 150000) {
-                max_temp = temp;
-            }
-            fclose(fd);
-        }
-    }
-    return max_temp > 0 ? (float)max_temp / 1000.0f : 40.0f;
-}
-
-static float read_ram_usage(void) {
-    FILE *fd = fopen("/proc/meminfo", "r");
-    if (!fd) return 0.0f;
-    long total = 0, available = 0; char line[256];
-    while (fgets(line, sizeof(line), fd)) {
-        if (strncmp(line, "MemTotal:", 9) == 0) sscanf(line, "MemTotal: %ld kB", &total);
-        if (strncmp(line, "MemAvailable:", 13) == 0) sscanf(line, "MemAvailable: %ld kB", &available);
-    }
-    fclose(fd);
-    return total == 0 ? 0.0f : (float)(total - available) / (float)total;
-}
-
-static void read_uptime(int *hours, int *mins, int *secs) {
-    FILE *fd = fopen("/proc/uptime", "r");
-    if (fd) {
-        float uptime;
-        if (fscanf(fd, "%f", &uptime) == 1) {
-            int total_secs = (int)uptime;
-            *hours = total_secs / 3600;
-            *mins = (total_secs % 3600) / 60;
-            *secs = total_secs % 60;
-        }
-        fclose(fd);
-    }
-}
-
-static int read_total_tasks(void) {
-    FILE *fd = fopen("/proc/loadavg", "r");
-    int running = 0, total = 0;
-    if (fd) {
-        if (fscanf(fd, "%*f %*f %*f %d/%d", &running, &total) != 2) { total = 0; }
-        fclose(fd);
-    }
-    return total;
-}
-
-/* --- 2D RASTERIZATION ENGINE --- */
+static uint16_t frame_buffer[PIXEL_COUNT];
 
 static inline uint16_t rgb_to_rgb565(uint8_t r, uint8_t g, uint8_t b) {
     return (uint16_t)(((r & 0xF8U) << 8) | ((g & 0xFCU) << 3) | (b >> 3));
 }
 
 static inline void draw_pixel(int32_t x, int32_t y, uint16_t color) {
-    if (x >= 0 && x < TFT_WIDTH && y >= 0 && y < TFT_HEIGHT) {
-        frame_buffer[(uint32_t)y * TFT_WIDTH + (uint32_t)x] = color;
+    if (x >= 0 && x < TFT_WIDTH && y >= 0 && y < TFT_HEIGHT) frame_buffer[(uint32_t)y * TFT_WIDTH + (uint32_t)x] = color;
+}
+
+static void draw_bitmap(int32_t x, int32_t y, int32_t w, int32_t h, const uint16_t *b) {
+    for (int32_t i = 0; i < h; i++) {
+        for (int32_t j = 0; j < w; j++) {
+            if (b[i * w + j] != 0x0000) draw_pixel(x + j, y + i, b[i * w + j]);
+        }
     }
 }
 
 static void draw_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint16_t color) {
-    for (int32_t i = 0; i < h; i++) {
-        for (int32_t j = 0; j < w; j++) {
+    for (int32_t i = 0; i < h; i++)
+        for (int32_t j = 0; j < w; j++)
             draw_pixel(x + j, y + i, color);
-        }
-    }
 }
 
-static void draw_instrument_dial(int32_t xc, int32_t yc, int32_t r, uint16_t ring_color, uint16_t tick_color) {
-    int32_t x = 0; int32_t y = r; int32_t d = 3 - 2 * r;
-    while (y >= x) {
-        draw_pixel(xc+x, yc+y, ring_color); draw_pixel(xc-x, yc+y, ring_color);
-        draw_pixel(xc+x, yc-y, ring_color); draw_pixel(xc-x, yc-y, ring_color);
-        draw_pixel(xc+y, yc+x, ring_color); draw_pixel(xc-y, yc+x, ring_color);
-        draw_pixel(xc+y, yc-x, ring_color); draw_pixel(xc-y, yc-x, ring_color);
-        x++; 
-        if (d > 0) { y--; d = d + 4 * (x - y) + 10; } 
-        else { d = d + 4 * x + 6; }
-    }
-    draw_rect(xc - r - 4, yc, 8, 1, tick_color); 
-    draw_rect(xc + r - 4, yc, 8, 1, tick_color); 
-    draw_rect(xc, yc - r - 4, 1, 8, tick_color); 
-    draw_rect(xc, yc + r - 4, 1, 8, tick_color); 
-}
-
-static void draw_text_shadowed(int32_t x, int32_t y, const char *text, uint16_t color, uint16_t shadow, uint8_t scale) {
+static void draw_text_shadowed(int16_t x, int16_t y, const char *text, uint16_t color, uint16_t shadow, uint8_t scale) {
     Graphics3D_DrawString(frame_buffer, TFT_WIDTH, TFT_HEIGHT, (int16_t)(x + 1), (int16_t)(y + 1), text, shadow, scale);
-    Graphics3D_DrawString(frame_buffer, TFT_WIDTH, TFT_HEIGHT, (int16_t)x, (int16_t)y, text, color, scale);
+    Graphics3D_DrawString(frame_buffer, TFT_WIDTH, TFT_HEIGHT, x, y, text, color, scale);
 }
 
-/* --- MAIN EXECUTION --- */
+static int is_btn_pressed(uint8_t pin, int *last_state) {
+    int current_state = (hal_gpio_get_level(pin) == 0);
+    int is_trigger = (current_state && !(*last_state));
+    *last_state = current_state;
+    return is_trigger;
+}
 
 int main(void) {
-    if (system_mount_vfs() < 0) system_panic();
-
-    /* Initialize background thermal load simulator */
-    load_sim_start_background();
+    if (system_mount_vfs() < 0) while(1);
 
     int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (mem_fd < 0) system_panic();
-
-    if (hal_rpi_init(mem_fd) < 0) {
-        close(mem_fd);
-        system_panic();
-    }
+    if (mem_fd < 0) while(1);
+    if (hal_rpi_init(mem_fd) < 0) { close(mem_fd); while(1); }
     close(mem_fd);
 
-    hal_gpio_set_function(8, GPIO_ALT0); hal_gpio_set_function(9, GPIO_ALT0);
-    hal_gpio_set_function(10, GPIO_ALT0); hal_gpio_set_function(11, GPIO_ALT0);
-    hal_gpio_set_function(24, GPIO_OUTPUT); hal_gpio_set_function(25, GPIO_OUTPUT);
+    hal_gpio_set_function((uint8_t)8, GPIO_ALT0); hal_gpio_set_function((uint8_t)9, GPIO_ALT0);
+    hal_gpio_set_function((uint8_t)10, GPIO_ALT0); hal_gpio_set_function((uint8_t)11, GPIO_ALT0);
+    hal_gpio_set_function((uint8_t)24, GPIO_OUTPUT); hal_gpio_set_function((uint8_t)25, GPIO_OUTPUT);
+
+    hal_gpio_set_function(BTN_JUMP, GPIO_INPUT); hal_gpio_set_pullup(BTN_JUMP);
+    hal_gpio_set_function(BTN_DUCK, GPIO_INPUT); hal_gpio_set_pullup(BTN_DUCK);
+    hal_gpio_set_function(BTN_START, GPIO_INPUT); hal_gpio_set_pullup(BTN_START);
 
     const spi_driver_ops_t *spi_ops = hal_rpi_get_spi_ops();
     st7789_init_sequence(spi_ops);
 
-    const uint16_t c_white = rgb_to_rgb565(255, 255, 255);
-    const uint16_t c_black = rgb_to_rgb565(0, 0, 0);
-    const uint16_t c_cyan  = rgb_to_rgb565(0, 255, 255);
-    const uint16_t c_mag   = rgb_to_rgb565(255, 0, 255);
-    const uint16_t bg      = rgb_to_rgb565(5, 8, 15);
-    const uint16_t grid    = rgb_to_rgb565(15, 25, 40);
+    const uint16_t c_white  = rgb_to_rgb565(255, 255, 255);
+    const uint16_t c_black  = rgb_to_rgb565(0, 0, 0);
+    const uint16_t c_red    = rgb_to_rgb565(255, 30, 30);
+    const uint16_t c_yellow = rgb_to_rgb565(255, 255, 0);
+    const uint16_t bg       = rgb_to_rgb565(135, 206, 235);
 
-    /* Phase 1: Boot Logo Overlay */
-    memcpy(frame_buffer, BOOT_LOGO, PIXEL_COUNT * sizeof(uint16_t));
-    draw_text_shadowed(44, 200, "Dang-Khoa N. Nguyen", c_white, c_black, 1);
-    draw_text_shadowed(76, 215, "ID: 24161099", c_cyan, c_black, 1);
-    st7789_flush_buffer(spi_ops, frame_buffer, TFT_WIDTH, TFT_HEIGHT);
-    usleep(3000000);
-
-    /* Phase 2: Telemetry Render Engine setup */
-    Vector3D base_verts[VERTEX_COUNT] = {
-        {-1.0f,-1.0f,-1.0f,1.0f}, {1.0f,-1.0f,-1.0f,1.0f}, {1.0f,1.0f,-1.0f,1.0f}, {-1.0f,1.0f,-1.0f,1.0f},
-        {-1.0f,-1.0f,1.0f,1.0f},  {1.0f,-1.0f,1.0f,1.0f},  {1.0f,1.0f,1.0f,1.0f},  {-1.0f,1.0f,1.0f,1.0f},
-        {0.0f,0.0f,0.0f,1.0f},    {1.3f,0.0f,0.0f,1.0f},   {0.0f,1.3f,0.0f,1.0f},  {0.0f,0.0f,1.3f,1.0f}
-    };
-    Vector3D scaled[VERTEX_COUNT], trans[VERTEX_COUNT]; Point2D proj[VERTEX_COUNT];
-    const Edge edges[EDGE_COUNT] = {{0,1},{1,2},{2,3},{3,0}, {4,5},{5,6},{6,7},{7,4}, {0,4},{1,5},{2,6},{3,7}};
-
-    float rot_x = 0.0f, rot_y = 0.0f, rot_z = 0.0f, matrix[9];
-    float t_cpu = 0.0f, t_temp = 40.0f, t_ram = 0.0f;
-    float s_cpu = 0.0f, s_temp = 40.0f, s_ram = 0.0f;
-    const float EMA = 0.05f; 
-    const float dt = 0.033f;
+    for (int32_t i = 0; i < PIXEL_COUNT; i++) frame_buffer[i] = BOOT_LOGO[i];
     
-    char buf[64];
-    uint32_t frame_counter = 0;
+    draw_text_shadowed(40, 195, "Assc Prof:", c_yellow, c_black, 2);
+    draw_text_shadowed(0, 215, "Truong Ngoc Son", c_white, c_black, 2);
+    st7789_flush_buffer(spi_ops, frame_buffer, TFT_WIDTH, TFT_HEIGHT);
+    
+    lcd_init();
+    lcd_print("DINO RUNNER     ", 1);
+    lcd_print("Initializing... ", 2);
+    for (int k = 0; k < 80; k++) {
+        st7789_flush_buffer(spi_ops, frame_buffer, TFT_WIDTH, TFT_HEIGHT);
+        usleep(20000);
+    }
 
-    /* Tell QEMU/Serial that UI loop is starting */
-    printf("[PID 1] Hardware initialized. Entering Render Loop...\n");
-    fflush(stdout);
+    int game_state = 0; 
+    float dino_y = 180.0f, dino_vy = 0.0f;
+    int dino_w = 48, dino_h = 48;
+    float obs_x = 240.0f;
+    int obs_w = 32, obs_h = 48, obs_type = 0;
+    float speed = 4.0f;
+    int score = 0, high_score = 0;
+    
+    int btn_jump_last = 0, btn_start_last = 0, btn_duck_last = 0;
+    int lcd_page = 0;
+    int last_game_state = -1, last_score = -1, last_lcd_page = -1;
+
+    char lcd_buf[32];
+    char tft_buf[64];
 
     while (1) {
-        if (frame_counter % 15 == 0) {
-            t_cpu = read_cpu_load(); 
-            t_temp = read_cpu_temp(); 
-            t_ram = read_ram_usage();
+        int trigger_jump = is_btn_pressed(BTN_JUMP, &btn_jump_last);
+        int trigger_start = is_btn_pressed(BTN_START, &btn_start_last);
+        int trigger_duck = is_btn_pressed(BTN_DUCK, &btn_duck_last);
+        int is_ducking = (hal_gpio_get_level(BTN_DUCK) == 0);
+
+        if (trigger_duck) {
+            lcd_page = (lcd_page + 1) % 3;
         }
-        frame_counter++;
 
-        s_cpu += EMA * (t_cpu - s_cpu); 
-        s_temp += EMA * (t_temp - s_temp); 
-        s_ram += EMA * (t_ram - s_ram);
+        if (game_state == 0) {
+            if (trigger_start || trigger_jump) {
+                game_state = 1;
+                score = 0; speed = 4.0f; dino_y = 180.0f; obs_x = 240.0f;
+                lcd_page = 0;
+            }
+        } else if (game_state == 1) {
+            dino_h = (is_ducking && dino_y == 180.0f) ? 24 : 48;
+            if ((trigger_jump || trigger_start) && dino_y == 180.0f) dino_vy = -10.5f;
 
-        for (int32_t i = 0; i < PIXEL_COUNT; i++) frame_buffer[i] = bg;
-        for (int32_t x = 10; x < TFT_WIDTH; x += 15) {
-            for (int32_t y = 10; y < TFT_HEIGHT; y += 15) {
-                draw_pixel(x, y, grid);
+            dino_y += dino_vy;
+            dino_vy += 0.7f;
+            if (dino_y >= 180.0f) { dino_y = 180.0f; dino_vy = 0.0f; }
+
+            obs_x -= speed;
+            if (obs_x < -50.0f) {
+                obs_x = 240.0f; score += 10;
+                speed += 0.3f; if (speed > 16.0f) speed = 16.0f;
+                obs_type = (score % 30 == 0) ? 1 : 0; 
+                obs_h = obs_type ? 24 : 48; obs_w = obs_type ? 40 : 32;
+            }
+
+            float pad_x = 8.0f;
+            float pad_y = 8.0f;
+            float o_pad_x = 6.0f;
+            float o_pad_y = 6.0f;
+
+            float d_l = 30.0f + pad_x;
+            float d_r = 30.0f + (float)dino_w - pad_x;
+            float d_t = dino_y - (float)dino_h + pad_y;
+            float d_b = dino_y - pad_y;
+            
+            float o_bot = (obs_type == 1) ? 155.0f : 180.0f;
+            float o_top = o_bot - (float)obs_h;
+            
+            float o_l = obs_x + o_pad_x;
+            float o_r = obs_x + (float)obs_w - o_pad_x;
+            float o_t = o_top + o_pad_y;
+            float o_b = o_bot - o_pad_y;
+
+            if (d_r > o_l && d_l < o_r && d_b > o_t && d_t < o_b) {
+                game_state = 2;
+                if (score > high_score) high_score = score;
+            }
+        } else if (game_state == 2) {
+            if (trigger_start || trigger_jump) {
+                game_state = 0;
             }
         }
 
-        float rot_spd = 0.4f + (s_cpu * 4.0f);
-        rot_x += rot_spd * dt; rot_y += rot_spd * 1.3f * dt; rot_z += rot_spd * 0.4f * dt;
+        if (game_state != last_game_state || score != last_score || lcd_page != last_lcd_page) {
+            last_game_state = game_state;
+            last_score = score;
+            last_lcd_page = lcd_page;
 
-        float scale = 0.8f + ((s_temp - 30.0f) / 100.0f);
-        for (int32_t i = 0; i < VERTEX_COUNT; ++i) {
-            scaled[i].x = base_verts[i].x * scale; scaled[i].y = base_verts[i].y * scale;
-            scaled[i].z = base_verts[i].z * scale; scaled[i].w = 1.0f;
+            if (lcd_page == 0) {
+                if (game_state == 0) {
+                    lcd_print("DINO RUNNER     ", 1);
+                    lcd_print("PRESS START     ", 2);
+                } else if (game_state == 1) {
+                    lcd_print("DINO RUNNER     ", 1);
+                    snprintf(lcd_buf, sizeof(lcd_buf), "SCORE: %05d    ", score);
+                    lcd_print(lcd_buf, 2);
+                } else {
+                    lcd_print("GAME OVER       ", 1);
+                    snprintf(lcd_buf, sizeof(lcd_buf), "SCORE: %05d    ", score);
+                    lcd_print(lcd_buf, 2);
+                }
+            } else if (lcd_page == 1) {
+                lcd_print("Nguyen Dinh Khoi", 1);
+                lcd_print("24161101        ", 2);
+            } else if (lcd_page == 2) {
+                lcd_print("Le Vu Thanh Danh", 1);
+                lcd_print("24161068        ", 2);
+            }
         }
 
-        /* 
-         * Thermal calibration: Normalized for [40.0, 57.0] Celsius range 
-         * norm = 0.0 at 40C (Cyan/Blue), norm = 1.0 at 57C (Red/Magenta)
-         */
-        float norm = (s_temp - 40.0f) / 17.0f;
-        if (norm < 0.0f) norm = 0.0f; 
-        if (norm > 1.0f) norm = 1.0f;
+        for (int32_t i = 0; i < PIXEL_COUNT; i++) frame_buffer[i] = bg;
+        draw_rect(0, 180, 240, 2, c_black);
         
-        uint8_t r = (uint8_t)(norm * 255.0f);
-        uint8_t g = (uint8_t)((1.0f - norm) * 255.0f);
-        uint8_t b = (uint8_t)((1.0f - norm) * 255.0f + (norm * 50.0f));
+        draw_bitmap(30, (int32_t)dino_y - dino_h, dino_w, dino_h, FACE_SPRITE);
+        int o_y = (obs_type == 1) ? (155 - obs_h) : (180 - obs_h);
+        if (obs_type == 1) draw_bitmap((int32_t)obs_x, o_y, obs_w, obs_h, PLANE_SPRITE); 
+        else draw_bitmap((int32_t)obs_x, o_y, obs_w, obs_h, CACTUS_SPRITE);
 
-        Graphics3D_ComputeRotationMatrix(matrix, rot_x, rot_y, rot_z);
-        Graphics3D_RotateVertices(scaled, trans, matrix, VERTEX_COUNT);
-        Graphics3D_ProjectVertices(trans, proj, VERTEX_COUNT, TFT_WIDTH, TFT_HEIGHT, 120.0f, 3.0f);
-
-        draw_instrument_dial(TFT_WIDTH/2, TFT_HEIGHT/2, 60, rgb_to_rgb565(r/3, g/3, b/3), c_cyan);
-
-        for (int32_t i = 0; i < EDGE_COUNT; ++i) {
-            float intensity = 1.0f - (((trans[edges[i].v1].z + trans[edges[i].v2].z) * 0.5f + 1.5f) / 3.0f);
-            if (intensity < 0.15f) intensity = 0.15f; 
-            if (intensity > 1.0f) intensity = 1.0f;
-            uint16_t edge_color = rgb_to_rgb565((uint8_t)(r*intensity), (uint8_t)(g*intensity), (uint8_t)(b*intensity));
-            Graphics3D_DrawLine(frame_buffer, TFT_WIDTH, TFT_HEIGHT, proj[edges[i].v1].x, proj[edges[i].v1].y, proj[edges[i].v2].x, proj[edges[i].v2].y, edge_color);
-        }
-
-        Point2D c = proj[8];
-        Graphics3D_DrawLine(frame_buffer, TFT_WIDTH, TFT_HEIGHT, c.x, c.y, proj[9].x, proj[9].y, rgb_to_rgb565(255, 30, 80));
-        Graphics3D_DrawLine(frame_buffer, TFT_WIDTH, TFT_HEIGHT, c.x, c.y, proj[10].x, proj[10].y, rgb_to_rgb565(30, 255, 80));
-        Graphics3D_DrawLine(frame_buffer, TFT_WIDTH, TFT_HEIGHT, c.x, c.y, proj[11].x, proj[11].y, rgb_to_rgb565(50, 100, 255));
-        draw_rect(c.x - 1, c.y - 1, 3, 3, c_white);
-
-        int32_t l = 15, t = 2;
-        draw_rect(5,5,l,t,c_mag); draw_rect(5,5,t,l,c_mag);
-        draw_rect(TFT_WIDTH-5-l,5,l,t,c_mag); draw_rect(TFT_WIDTH-5-t,5,t,l,c_mag);
-        draw_rect(5,TFT_HEIGHT-5-t,l,t,c_mag); draw_rect(5,TFT_HEIGHT-5-l,t,l,c_mag);
-        draw_rect(TFT_WIDTH-5-l,TFT_HEIGHT-5-t,l,t,c_mag); draw_rect(TFT_WIDTH-5-t,TFT_HEIGHT-5-l,t,l,c_mag);
-
-        uint16_t bar_color = rgb_to_rgb565(r, g, b);
-        const int32_t pad_x = 24;
-
-        snprintf(buf, sizeof(buf), "CPU:%3.0f%%", s_cpu * 100.0f);
-        draw_text_shadowed(pad_x, 10, buf, c_white, c_black, 1);
-        draw_rect(pad_x, 20, (int32_t)(s_cpu * 60.0f), 3, bar_color);
-
-        snprintf(buf, sizeof(buf), "RAM:%3.0f%%", s_ram * 100.0f);
-        draw_text_shadowed(TFT_WIDTH - 85, 10, buf, c_white, c_black, 1);
-        draw_rect(TFT_WIDTH - 85, 20, (int32_t)(s_ram * 60.0f), 3, c_cyan);
-
-        snprintf(buf, sizeof(buf), "TMP:%3.1fC", s_temp);
-        draw_text_shadowed(pad_x, TFT_HEIGHT - 30, buf, bar_color, c_black, 1);
-
-        int hh = 0, mm = 0, ss = 0; read_uptime(&hh, &mm, &ss);
-        snprintf(buf, sizeof(buf), "UPT:%02d:%02d:%02d", hh, mm, ss);
-        draw_text_shadowed(pad_x, TFT_HEIGHT - 16, buf, c_white, c_black, 1);
-
-        snprintf(buf, sizeof(buf), "TSK:%d", read_total_tasks());
-        draw_text_shadowed(TFT_WIDTH - 75, TFT_HEIGHT - 16, buf, c_white, c_black, 1);
+        snprintf(tft_buf, sizeof(tft_buf), "HI: %05d  SCR: %05d", high_score, score);
+        draw_text_shadowed(10, 10, tft_buf, c_white, c_black, 1);
+        
+        if (game_state == 0) draw_text_shadowed(45, 100, "PRESS START", c_yellow, c_black, 1);
+        if (game_state == 2) draw_text_shadowed(60, 100, "GAME OVER", c_red, c_black, 2);
 
         st7789_flush_buffer(spi_ops, frame_buffer, TFT_WIDTH, TFT_HEIGHT);
     }
